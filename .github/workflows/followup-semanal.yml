@@ -1,0 +1,33 @@
+name: Follow Up Semanal — Consultivo Trabalhista
+on:
+  schedule:
+    # 13:07 UTC = 10:07 BRT
+    - cron: "7 13 * * 1"
+  workflow_dispatch:
+
+concurrency:
+  group: followup-trabalhista
+  cancel-in-progress: false
+
+jobs:
+  followup-trabalhista:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout do repositorio
+        uses: actions/checkout@v4
+      - name: Configurar Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Instalar dependencias
+        run: pip install requests openpyxl
+      - name: Executar follow up trabalhista
+        env:
+          TENANT_ID:     ${{ secrets.TENANT_ID }}
+          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          REMETENTE:     ${{ secrets.REMETENTE }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          DESTINATARIOS_TRABALHISTA: ${{ secrets.DESTINATARIOS_TRABALHISTA }}
+        run: python followup-trabalhista.py
