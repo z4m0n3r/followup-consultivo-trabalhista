@@ -1,28 +1,24 @@
 """
-Follow Up Semanal — Consultivo Trabalhista — D'Artibale Faria Advogados
-=======================================================================
-Versão simplificada do follow up para a área trabalhista.
+Follow Up Semanal — D'Artibale Faria Advogados
+==============================================
+Para cada um dos clientes (linhas da planilha):
+  1. Resolve o(s) plano(s) de Planner a partir do ID do grupo.
+  2. Varre TODOS os planos do grupo (um grupo pode ter vários).
+  3. Mantém apenas tarefas atribuídas às 8 pessoas do CONSULTIVO.
+  4. Classifica por bucket + data e monta o follow up no formato padrão.
+  5. Envia por SMTP (Gmail) APENAS para Rafael e Maria Clara.
 
-Diferença fundamental em relação ao cível: todo o fluxo de trabalho do
-time trabalhista converge para o bucket de concluído. Não há necessidade
-de classificar buckets, tratar pendências, impedimentos ou carryover de
-tarefas não iniciadas. O script lê as tarefas concluídas na semana
-anterior (segunda a sexta) e monta um resumo único.
+Defensivo por design: retries para throttling/erros de rede, classificação
+de bucket tolerante a variação de nome, e parada limpa com mensagem clara
+se faltar permissão — nunca envia dado errado.
 
-Fluxo:
-  1. Lê a planilha de configuração com clientes e IDs de grupo/plano.
-  2. Autentica via client_credentials no Microsoft Graph.
-  3. Resolve os IDs dos 2 integrantes do consultivo trabalhista.
-  4. Para cada cliente, varre todos os planos do grupo.
-  5. Filtra tarefas atribuídas ao time trabalhista E concluídas na
-     semana anterior (por completedDateTime).
-  6. Monta e envia o e-mail de follow up via SMTP.
-
-Defensivo por design: retries para throttling e erros transitórios,
-parada limpa se faltar permissão, e nunca envia dado errado.
+CORREÇÃO 2026-06: tarefas NÃO INICIADAS que venceram na SEMANA ANTERIOR e não
+foram concluídas deixavam de aparecer em qualquer seção (limbo). Agora são
+arrastadas para "Previstas para Esta Semana", marcadas como pendentes.
 """
 
 import os
+import re
 import sys
 import time
 import json
@@ -51,19 +47,20 @@ REMETENTE     = os.environ["REMETENTE"]
 SMTP_PASSWORD = os.environ["SMTP_PASSWORD"]
 SMTP_HOST     = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT     = int(os.environ.get("SMTP_PORT", "587"))
-PLANILHA      = os.environ.get("PLANILHA_TRABALHISTA", "followup-consultivo-trabalhista.xlsx")
+PLANILHA      = os.environ.get("PLANILHA", "followup.xlsx")
 GRAPH_BASE    = "https://graph.microsoft.com/v1.0"
 
+# Limite opcional para teste (ex.: TEST_LIMIT=1 processa só o 1º cliente)
 TEST_LIMIT    = int(os.environ.get("TEST_LIMIT", "0"))
 
-# Destinatários FIXOS
+# Destinatários FIXOS — a coluna de e-mails da planilha é ignorada de propósito
 DESTINATARIOS = [
     "karin.gambaro@dartibalefaria.com",
     "moisesmiguel.garcia@dartibalefaria.com",
 ]
 
-# Os 2 integrantes do consultivo trabalhista
-CONSULTIVO_TRABALHISTA_EMAILS = [
+# Os integrantes do CONSULTIVO — o filtro mantém só tarefas destas pessoas
+CONSULTIVO_EMAILS = [
     "karin.gambaro@dartibalefaria.com",
     "moisesmiguel.garcia@dartibalefaria.com",
 ]
@@ -72,10 +69,8 @@ CONSULTIVO_TRABALHISTA_EMAILS = [
 # ─── Utilidades de texto ──────────────────────────────────────────────────────
 
 def sem_acento(s: str) -> str:
-    mapa = str.maketrans(
-        "áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ",
-        "aaaaaeeeeiiiiooooouuuucAAAAAEEEEIIIIOOOOOUUUUC",
-    )
+    mapa = str.maketrans("áàâãäéèêëíìîïóòôõöúùûüçÁÀÂÃÄÉÈÊËÍÌÎÏÓÒÔÕÖÚÙÛÜÇ",
+                         "aaaaaeeeeiiiiooooouuuucAAAAAEEEEIIIIOOOOOUUUUC")
     return s.translate(mapa)
 
 def norm(s: str) -> str:
@@ -107,7 +102,7 @@ def roles_do_token(token: str) -> list:
         return []
 
 
-# ─── Chamadas Graph com retry ─────────────────────────────────────────────────
+# ─── Chamadas Graph com retry (trata 429 e erros transitórios) ────────────────
 
 def _req(token: str, url: str, tentativas: int = 5):
     h = {"Authorization": f"Bearer {token}"}
@@ -119,6 +114,13 @@ def _req(token: str, url: str, tentativas: int = 5):
             continue
         return r
     return r
+
+def get_one(token: str, path: str) -> dict:
+    r = _req(token, f"{GRAPH_BASE}{path}")
+    if r.status_code == 404:
+        return {}
+    r.raise_for_status()
+    return r.json()
 
 def get_all(token: str, path: str) -> list:
     items = []
@@ -134,11 +136,14 @@ def get_all(token: str, path: str) -> list:
     return items
 
 
-# ─── Resolução dos IDs do consultivo trabalhista ──────────────────────────────
+# ─── Resolução dos IDs do consultivo ──────────────────────────────────────────
 
-def resolver_ids_trabalhista(token: str, group_ids: list) -> dict:
-    alvo = {e.lower() for e in CONSULTIVO_TRABALHISTA_EMAILS}
-    encontrados = {}
+def resolver_ids_consultivo(token: str, group_ids: list) -> dict:
+    """Monta {user_id: email} das 8 pessoas do consultivo lendo os MEMBROS
+    dos grupos (usa Group.Read.All, não depende de User.Read.All).
+    Varre os grupos acumulando o mapa e para quando achar todos os 8."""
+    alvo = {e.lower() for e in CONSULTIVO_EMAILS}
+    encontrados = {}  # email_lower -> user_id
     for gid in group_ids:
         if len(encontrados) == len(alvo):
             break
@@ -154,24 +159,30 @@ def resolver_ids_trabalhista(token: str, group_ids: list) -> dict:
                     encontrados[val] = m["id"]
     faltando = sorted(alvo - set(encontrados.keys()))
     if faltando:
-        print("[aviso] Não encontrei nos grupos os seguintes integrantes do trabalhista:")
+        print("[aviso] Não encontrei nos grupos os seguintes integrantes do consultivo:")
         for e in faltando:
             print(f"   - {e}")
+        print("   (As tarefas dessas pessoas não entrarão no filtro.)")
     if not encontrados:
-        print("[erro] Nenhum integrante do trabalhista foi resolvido. "
-              "Execução interrompida.")
+        print("[erro] Nenhum integrante do consultivo foi resolvido. "
+              "Execução interrompida para não enviar follow up sem filtro.")
         sys.exit(2)
+    # retorna {user_id: email}
     return {uid: email for email, uid in encontrados.items()}
 
 
-# ─── Datas (semana anterior, segunda a sexta) ─────────────────────────────────
+# ─── Datas (semana anterior e corrente, segunda a sexta) ──────────────────────
 
-def janela_semana_anterior() -> dict:
+def janelas_semana() -> dict:
     hoje = datetime.now(TZ).date()
     seg_corrente = hoje - timedelta(days=hoje.weekday())
+    sex_corrente = seg_corrente + timedelta(days=4)
     seg_anterior = seg_corrente - timedelta(days=7)
     sex_anterior = seg_corrente - timedelta(days=3)
-    return {"ini": seg_anterior, "fim": sex_anterior}
+    return {
+        "ini_ant": seg_anterior, "fim_ant": sex_anterior,
+        "ini_cur": seg_corrente, "fim_cur": sex_corrente,
+    }
 
 def data_campo(t: dict, campo: str):
     val = t.get(campo)
@@ -186,32 +197,59 @@ def entre(d, ini, fim) -> bool:
     return d is not None and ini <= d <= fim
 
 
-# ─── Buckets ignorados (ritual interno, backlog, modelos) ─────────────────────
+# ─── Classificação de bucket tolerante a variação de nome ─────────────────────
+# Categorias: concluido | nao_iniciado | em_andamento | validacao_gestor
+#             assinatura | pendencia | outro
 
+# Buckets explicitamente ignorados (não entram em nenhuma seção)
 BUCKETS_IGNORADOS = ("modelo", "backlog", "bloque")
 
-def bucket_ignorado(nome: str) -> bool:
+EM_ANDAMENTO_BUCKETS = ("andamento", "em andamento", "doing", "em progresso")
+
+def categoria_bucket(nome: str) -> str:
     n = norm(nome)
-    return any(x in n for x in BUCKETS_IGNORADOS)
+    if any(x in n for x in BUCKETS_IGNORADOS):
+        return "ignorar"
+    if "assinatura" in n:
+        return "assinatura"
+    if "conclu" in n:
+        return "concluido"
+    if any(x in n for x in EM_ANDAMENTO_BUCKETS):
+        return "em_andamento"
+    if "valida" in n and "cliente" in n:
+        return "pendencia"          # validação com o cliente
+    if "pend" in n:
+        return "pendencia"          # com pendência
+    return "outro"
 
 
-# ─── Títulos de ritual interno (nunca entram no follow up) ─────────────────────
+def categoria_status(t: dict) -> str:
+    status = (t.get("status") or "").strip().lower()
+    if status in ("inprogress", "in progress", "doing", "andamento", "em andamento", "em progresso"):
+        return "em_andamento"
+    if status in ("completed", "done", "concluido", "concluida", "finalizado", "finished"):
+        return "concluido"
+    if status in ("notstarted", "not started", "to do", "todo", "nao iniciado", "não iniciado", "a fazer", "pending"):
+        return "nao_iniciado"
 
-TITULOS_EXCLUIDOS = (
-    "follow-up semanal", "follow up semanal",
-    "reuniao mensal", "reunião mensal",
-    "follow-up semanal | consultivo trabalhista",
-    "follow up consultivo trabalhista",
-    "follow-up | consultivo trabalhista",
-    "follow up - consultivo trabalhista",
-)
+    percent = t.get("percentComplete")
+    try:
+        if percent is not None:
+            percent = int(percent)
+            if percent == 100:
+                return "concluido"
+            if 0 < percent < 100:
+                return "em_andamento"
+            return "nao_iniciado"
+    except Exception:
+        pass
 
-def titulo_excluido(t: dict) -> bool:
-    titulo = norm(t.get("title") or "")
-    return any(x in titulo for x in (norm(e) for e in TITULOS_EXCLUIDOS))
+    if t.get("completedDateTime"):
+        return "concluido"
+    return "outro"
 
 
-# ─── Coleta de planos e tarefas ───────────────────────────────────────────────
+# ─── Coleta de planos, buckets e tarefas do grupo ─────────────────────────────
 
 def planos_do_grupo(token: str, group_id: str) -> list:
     planos = get_all(token, f"/groups/{group_id}/planner/plans")
@@ -226,65 +264,115 @@ def tarefas_do_plano(token: str, plan_id: str) -> list:
 
 # ─── Filtro por responsável ───────────────────────────────────────────────────
 
-def e_do_trabalhista(t: dict, ids_trabalhista: set) -> bool:
+def e_do_consultivo(t: dict, ids_consultivo: set) -> bool:
     atrib = t.get("assignments") or {}
-    return any(uid in ids_trabalhista for uid in atrib.keys())
+    return any(uid in ids_consultivo for uid in atrib.keys())
 
 
-# ─── Montagem do follow up ────────────────────────────────────────────────────
+# ─── Montagem do follow up de um cliente ──────────────────────────────────────
 
-def montar_followup(token, cliente, group_id, ids_trabalhista, jan, plan_id_fixo=None) -> str:
+# Títulos que são ritual interno (nunca entram no follow up)
+TITULOS_EXCLUIDOS = ("follow-up semanal", "follow up semanal", "reuniao mensal", "reunião mensal", "Follow-up Semanal | Consutivo Cível", "Follow Up Consultivo Cível", "Follow-up | Consultivo Empresarial", "Follow Up - Consultivo Cível")
+
+def titulo_excluido(t: dict) -> bool:
+    titulo = norm(t.get("title") or "")
+    return any(x in titulo for x in (norm(e) for e in TITULOS_EXCLUIDOS))
+
+def montar_followup(token, cliente, group_id, ids_consultivo, jan, plan_id_fixo=None) -> str:
     if plan_id_fixo:
         plan_ids = [plan_id_fixo]
     else:
         plan_ids = planos_do_grupo(token, group_id)
     if not plan_ids:
-        return None
+        return None  # nada a enviar
 
-    concluidas = []
+    resumo, previstas, assinatura, impedimentos = [], [], [], []
 
     for plan_id in plan_ids:
         buckets = buckets_do_plano(token, plan_id)
         for t in tarefas_do_plano(token, plan_id):
-            if not e_do_trabalhista(t, ids_trabalhista):
+            if not e_do_consultivo(t, ids_consultivo):
                 continue
             if titulo_excluido(t):
                 continue
-            nome_bucket = buckets.get(t.get("bucketId", ""), "")
-            if bucket_ignorado(nome_bucket):
+            cat = categoria_bucket(buckets.get(t.get("bucketId", ""), ""))
+            if cat == "ignorar":
                 continue
+            venc = data_campo(t, "dueDateTime")
             feito = data_campo(t, "completedDateTime")
-            if entre(feito, jan["ini"], jan["fim"]):
-                concluidas.append(t)
+            status = categoria_status(t)
 
-    return formatar_email(cliente, jan, concluidas)
+            # Pendente de Assinatura — por bucket, todas as datas
+            if cat == "assinatura":
+                assinatura.append((t, plan_id))
+                continue
+
+            # Impedimentos — pendência explícita ou status em andamento sem bucket de andamento
+            if cat == "pendencia" or \
+               (status == "em_andamento" and cat != "em_andamento") or \
+               (cat == "em_andamento" and status != "em_andamento"):
+                impedimentos.append((t, plan_id))
+                continue
+
+            # Resumo da última semana — concluídas na semana anterior (por data)
+            if entre(feito, jan["ini_ant"], jan["fim_ant"]):
+                resumo.append((t, plan_id))
+            # Previstas para esta semana — vencimento na semana corrente (por data)
+            elif entre(venc, jan["ini_cur"], jan["fim_cur"]):
+                previstas.append((t, plan_id))
+            # CORREÇÃO: carryover. Não iniciadas que venceram na SEMANA ANTERIOR e
+            # não foram concluídas. Sem este ramo, caíam no limbo. Agora entram nas
+            # previstas, marcadas como pendentes da semana passada.
+            elif status == "nao_iniciado" and entre(venc, jan["ini_ant"], jan["fim_ant"]):
+                t["_atrasada"] = True
+                previstas.append((t, plan_id))
+            # Opcional (descomente para resgatar QUALQUER atrasada não iniciada,
+            # inclusive de semanas mais antigas, não só a imediatamente anterior):
+            # elif status == "nao_iniciado" and venc is not None and venc < jan["ini_cur"]:
+            #     t["_atrasada"] = True
+            #     previstas.append((t, plan_id))
+
+    return formatar_email(token, cliente, group_id, jan,
+                          resumo, previstas, assinatura, impedimentos)
 
 
-def formatar_email(cliente, jan, concluidas):
-    ini = jan["ini"].strftime("%d/%m/%Y")
-    fim = jan["fim"].strftime("%d/%m/%Y")
+def linha_tarefa(t):
+    titulo = (t.get("title") or "(sem título)").strip()
+    venc = data_campo(t, "dueDateTime")
+    sufixo = f" — {venc.strftime('%d/%m/%Y')}" if venc else ""
+    if t.get("_atrasada"):
+        sufixo += " (pendente da semana anterior — não iniciada)"
+    return f"{titulo}{sufixo}"
+
+
+def formatar_email(token, cliente, group_id, jan,
+                   resumo, previstas, assinatura, impedimentos):
+    ini = jan["ini_ant"].strftime("%d/%m/%Y")
+    fim = jan["fim_ant"].strftime("%d/%m/%Y")
     L = []
-    L.append("[FOLLOW UP SEMANAL — CONSULTIVO TRABALHISTA]")
+    L.append("[FOLLOW UP SEMANAL]")
     L.append("")
     L.append("Boa tarde.")
     L.append("")
-    L.append(
-        f"Segue abaixo o resumo das demandas concluídas pelo time "
-        f"D'Artibale Faria — Consultivo Trabalhista, referente à semana "
-        f"de {ini} a {fim}."
-    )
+    L.append(f"Segue abaixo o resumo semanal das demandas tratadas pelo time "
+             f"D'Artibale Faria, referente à semana anterior de {ini} a {fim}.")
     L.append("")
-    L.append("Demandas Concluídas na Semana")
-    if not concluidas:
-        L.append("  Sem demandas concluídas nesta semana.")
-    else:
-        for i, t in enumerate(concluidas):
-            titulo = (t.get("title") or "(sem título)").strip()
-            feito = data_campo(t, "completedDateTime")
-            data_str = f" — {feito.strftime('%d/%m/%Y')}" if feito else ""
-            marcador = chr(ord("a") + i) + ")" if i < 26 else "•"
-            L.append(f"  {marcador} {titulo}{data_str}")
-    L.append("")
+
+    def bloco(titulo, itens):
+        L.append(titulo)
+        if not itens:
+            L.append("  Sem demandas nesta categoria.")
+        else:
+            for i, (t, _pid) in enumerate(itens):
+                marcador = chr(ord('a') + i) + ")" if i < 26 else "•"
+                L.append(f"  {marcador} {linha_tarefa(t)}")
+        L.append("")
+
+    bloco("Resumo das Principais Demandas da Última Semana", resumo)
+    bloco("Previstas para Esta Semana", previstas)
+    bloco("Pendente de Assinatura", assinatura)
+    bloco("Impedimentos ou Pendências do Parceiro", impedimentos)
+
     return "\n".join(L)
 
 
@@ -321,12 +409,9 @@ def ler_clientes(caminho: str) -> list:
             gid = pid
         if not gid:
             continue
+        # plan_id_fixo: usado quando PlannerID != GroupID (plano direto na planilha)
         plan_id_fixo = pid if (pid and pid != gid) else None
-        clientes.append({
-            "cliente": str(cliente).strip(),
-            "group_id": gid,
-            "plan_id_fixo": plan_id_fixo,
-        })
+        clientes.append({"cliente": str(cliente).strip(), "group_id": gid, "plan_id_fixo": plan_id_fixo})
     wb.close()
     return clientes
 
@@ -335,15 +420,16 @@ def ler_clientes(caminho: str) -> list:
 
 def main():
     print("\n" + "=" * 60)
-    print("  Follow Up Semanal — Consultivo Trabalhista")
+    print("  Follow Up Semanal — D'Artibale Faria")
     print(f"  {datetime.now(TZ).strftime('%d/%m/%Y %H:%M')}")
     print("=" * 60 + "\n")
 
     token = obter_token()
     print(f"Permissões do app: {roles_do_token(token) or 'NENHUMA'}\n")
 
-    jan = janela_semana_anterior()
-    print(f"Semana anterior: {jan['ini']:%d/%m} a {jan['fim']:%d/%m}\n")
+    jan = janelas_semana()
+    print(f"Semana anterior: {jan['ini_ant']:%d/%m} a {jan['fim_ant']:%d/%m}  |  "
+          f"corrente: {jan['ini_cur']:%d/%m} a {jan['fim_cur']:%d/%m}\n")
 
     clientes = ler_clientes(PLANILHA)
     if TEST_LIMIT > 0:
@@ -351,27 +437,22 @@ def main():
         print(f"[teste] MODO TESTE — apenas {len(clientes)} cliente(s).\n")
     print(f"[ok] {len(clientes)} clientes carregados.\n")
 
+    # Resolve os IDs do consultivo lendo membros de TODOS os grupos da planilha
     todos_grupos = [c["group_id"] for c in ler_clientes(PLANILHA)]
-    ids_trabalhista = set(resolver_ids_trabalhista(token, todos_grupos).keys())
-    print(f"[ok] {len(ids_trabalhista)} integrantes do trabalhista resolvidos.\n")
+    ids_consultivo = set(resolver_ids_consultivo(token, todos_grupos).keys())
+    print(f"[ok] {len(ids_consultivo)} integrantes do consultivo resolvidos.\n")
 
     enviados, vazios, erros = 0, 0, []
 
     for i, c in enumerate(clientes, 1):
         print(f"[{i:02d}/{len(clientes)}] {c['cliente']}")
         try:
-            corpo = montar_followup(
-                token, c["cliente"], c["group_id"],
-                ids_trabalhista, jan, c.get("plan_id_fixo"),
-            )
+            corpo = montar_followup(token, c["cliente"], c["group_id"], ids_consultivo, jan, c.get("plan_id_fixo"))
             if corpo is None:
                 print("   sem plano de Planner no grupo — pulado.")
                 vazios += 1
                 continue
-            assunto = (
-                f"[Follow Up Semanal — Trabalhista] "
-                f"{c['cliente']} — {datetime.now(TZ):%d/%m/%Y}"
-            )
+            assunto = f"[Follow Up Semanal] {c['cliente']} — {datetime.now(TZ):%d/%m/%Y}"
             enviar_email(assunto, corpo)
             print(f"   [ok] enviado para {', '.join(DESTINATARIOS)}")
             enviados += 1
