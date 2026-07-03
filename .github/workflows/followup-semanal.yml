@@ -29,4 +29,5 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           REMETENTE:     ${{ secrets.REMETENTE }}
           SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          PLANILHA:      followup-consultivo-trabalhista.xlsx
         run: python followup-trabalhista.py
